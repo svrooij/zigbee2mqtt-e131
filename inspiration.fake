@@ -1,0 +1,375 @@
+import * as dgram from 'dgram';
+import type {Device} from 'zigbee2mqtt/lib/model/device';
+import type {Group} from 'zigbee2mqtt/lib/model/group';
+import type Extension from 'zigbee2mqtt/lib/extension/extension';
+import type {Zigbee} from 'zigbee2mqtt/lib/zigbee';
+import type {MQTT} from 'zigbee2mqtt/lib/mqtt';
+import type {State} from 'zigbee2mqtt/lib/state';
+import type {EventBus} from 'zigbee2mqtt/lib/eventBus';
+
+// Import utilities - these will be available at runtime
+declare const logger: any;
+declare const settings: any;
+
+interface E131Config {
+    universes: Array<{
+        id: number;
+        devices: string[];
+        channelsPerDevice?: number;
+    }>;
+    enabled?: boolean;
+    port?: number;
+}
+
+interface E131Packet {
+    universeId: number;
+    sequence: number;
+    data: number[];
+    priority?: number;
+    sourceName?: string;
+}
+
+interface DeviceColorState {
+    state: 'ON' | 'OFF';
+    brightness?: number;
+    color?: {
+        x: number;
+        y: number;
+    };
+    transition?: number;
+}
+
+class E131Extension {
+    private zigbee: Zigbee;
+    private mqtt: MQTT;
+    private state: State;
+    private publishEntityState: (device: Device, payload: Record<string, any>, reason: string) => Promise<void>;
+    private eventBus: EventBus;
+    private enableDisableExtension: (enable: boolean, name: string) => Promise<void>;
+    private restartCallback: () => Promise<void>;
+    private addExtension: (extension: Extension) => Promise<void>;
+    
+    private server?: dgram.Socket;
+    private universeMap: Map<number, {devices: string[], channelsPerDevice: number}> = new Map();
+    private readonly DEFAULT_SACN_PORT = 5568;
+    private sequenceMap: Map<number, number> = new Map();
+    private config: E131Config = { universes: [] };
+
+    constructor(
+        zigbee: Zigbee,
+        mqtt: MQTT,
+        state: State,
+        publishEntityState: (device: Device, payload: Record<string, any>, reason: string) => Promise<void>,
+        eventBus: EventBus,
+        enableDisableExtension: (enable: boolean, name: string) => Promise<void>,
+        restartCallback: () => Promise<void>,
+        addExtension: (extension: Extension) => Promise<void>,
+    ) {
+        this.zigbee = zigbee;
+        this.mqtt = mqtt;
+        this.state = state;
+        this.publishEntityState = publishEntityState;
+        this.eventBus = eventBus;
+        this.enableDisableExtension = enableDisableExtension;
+        this.restartCallback = restartCallback;
+        this.addExtension = addExtension;
+    }
+
+    async start(): Promise<void> {
+        // Load E1.31 configuration from settings
+        this.config = this.getE131Config();
+        
+        if (!this.config.enabled) {
+            logger.info('E1.31 extension disabled in configuration');
+            return;
+        }
+
+        if (this.config.universes.length === 0) {
+            logger.warn('E1.31 extension: No universes configured');
+            return;
+        }
+
+        this.setupUniverseMapping();
+        await this.startE131Server();
+        
+        logger.info(`E1.31 extension started with ${this.config.universes.length} universe(s)`);
+    }
+
+    async stop(): Promise<void> {
+        if (this.server) {
+            this.server.close();
+            this.server = undefined;
+        }
+        
+        // Clean up event listeners
+        this.eventBus.removeListeners(this);
+        
+        logger.info('E1.31 extension stopped');
+    }
+
+    private getE131Config(): E131Config {
+        try {
+            // Access settings - this will be available at runtime in zigbee2mqtt context
+            const allSettings = (global as any).settings?.get() || {};
+            const e131Config = allSettings.e131 || {};
+            
+            return {
+                enabled: e131Config.enabled !== false, // Default to enabled
+                universes: e131Config.universes || [],
+                port: e131Config.port || this.DEFAULT_SACN_PORT
+            };
+        } catch (error) {
+            logger.error(`Failed to load E1.31 configuration: ${error}`);
+            return { universes: [], enabled: false };
+        }
+    }
+
+    private setupUniverseMapping(): void {
+        for (const universe of this.config.universes) {
+            const channelsPerDevice = universe.channelsPerDevice || 3; // Default to RGB (3 channels)
+            this.universeMap.set(universe.id, {
+                devices: universe.devices || [],
+                channelsPerDevice
+            });
+            
+            logger.info(`E1.31: Mapped universe ${universe.id} to ${universe.devices.length} device(s) (${channelsPerDevice} channels each)`);
+        }
+    }
+
+    private async startE131Server(): Promise<void> {
+        const port = this.config.port || this.DEFAULT_SACN_PORT;
+        this.server = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+        
+        this.server.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
+            try {
+                const packet = this.parseE131Packet(msg);
+                if (packet) {
+                    this.handleLightingData(packet).catch(error => {
+                        logger.error(`Error handling lighting data: ${error.message}`);
+                    });
+                }
+            } catch (error: any) {
+                logger.debug(`E1.31 packet parsing error from ${rinfo.address}: ${error.message}`);
+            }
+        });
+
+        this.server.on('listening', () => {
+            const address = this.server!.address() as dgram.AddressInfo;
+            logger.info(`E1.31 server listening on ${address.address}:${address.port}`);
+            
+            // Join multicast groups for configured universes
+            for (const universeId of this.universeMap.keys()) {
+                const multicastAddress = this.getMulticastAddress(universeId);
+                try {
+                    this.server!.addMembership(multicastAddress);
+                    logger.info(`E1.31: Joined multicast group for universe ${universeId}: ${multicastAddress}`);
+                } catch (error: any) {
+                    logger.error(`E1.31: Failed to join multicast group ${multicastAddress}: ${error.message}`);
+                }
+            }
+        });
+
+        this.server.on('error', (error: Error) => {
+            logger.error(`E1.31 server error: ${error.message}`);
+        });
+
+        this.server.bind(port);
+    }
+
+    private parseE131Packet(buffer: Buffer): E131Packet | null {
+        if (buffer.length < 126) return null; // Minimum packet size
+        
+        try {
+            // Validate packet identifier (ACN-E1.17)
+            const packetId = buffer.subarray(16, 28);
+            const expectedId = Buffer.from([0x41, 0x53, 0x43, 0x2d, 0x45, 0x31, 0x2e, 0x31, 0x37, 0x00, 0x00, 0x00]);
+            
+            if (!packetId.equals(expectedId)) return null;
+            
+            // Validate vector (should be 0x00000004 for sACN)
+            const vector = buffer.readUInt32BE(32);
+            if (vector !== 0x00000004) return null;
+            
+            // Extract universe ID (2 bytes at offset 113)
+            const universeId = buffer.readUInt16BE(113);
+            
+            // Extract sequence number (1 byte at offset 111)
+            const sequence = buffer.readUInt8(111);
+            
+            // Extract priority (1 byte at offset 108)
+            const priority = buffer.readUInt8(108);
+            
+            // Extract source name (64 bytes at offset 44)
+            const sourceNameBuffer = buffer.subarray(44, 108);
+            const sourceName = sourceNameBuffer.toString('utf8').replace(/\0.*$/g, '');
+            
+            // Check sequence for duplicate detection (except for sequence 0 which resets)
+            const lastSequence = this.sequenceMap.get(universeId) || 0;
+            if (sequence !== 0 && sequence <= lastSequence) {
+                return null; // Skip duplicate or out-of-order packet
+            }
+            this.sequenceMap.set(universeId, sequence);
+            
+            // Extract DMX data (starts at offset 126, up to 512 channels)
+            const dmxDataLength = Math.min(512, buffer.length - 126);
+            const dmxData = buffer.subarray(126, 126 + dmxDataLength);
+            
+            return {
+                universeId,
+                sequence,
+                data: Array.from(dmxData),
+                priority,
+                sourceName
+            };
+        } catch (error: any) {
+            logger.debug(`Error parsing E1.31 packet: ${error.message}`);
+            return null;
+        }
+    }
+
+    private async handleLightingData(packet: E131Packet): Promise<void> {
+        const universeConfig = this.universeMap.get(packet.universeId);
+        if (!universeConfig || universeConfig.devices.length === 0) return;
+
+        const { devices, channelsPerDevice } = universeConfig;
+
+        // Process each device in the universe
+        for (let i = 0; i < devices.length; i++) {
+            const deviceId = devices[i];
+            const device = this.zigbee.resolveEntity(deviceId);
+            
+            if (!device || !this.isDevice(device)) {
+                logger.debug(`E1.31: Device ${deviceId} not found or not a device`);
+                continue;
+            }
+
+            // Calculate DMX channel offset for this device
+            const channelOffset = i * channelsPerDevice;
+            
+            if (channelOffset >= packet.data.length) continue;
+
+            if (channelsPerDevice === 1) {
+                // Single channel (brightness only)
+                const brightness = packet.data[channelOffset];
+                await this.updateDeviceBrightness(device, brightness);
+            } else if (channelsPerDevice >= 3) {
+                // RGB or RGBW
+                const red = packet.data[channelOffset] || 0;
+                const green = packet.data[channelOffset + 1] || 0;
+                const blue = packet.data[channelOffset + 2] || 0;
+                const white = channelsPerDevice >= 4 ? packet.data[channelOffset + 3] : undefined;
+                
+                await this.updateDeviceColor(device, red, green, blue, white);
+            }
+        }
+    }
+
+    private async updateDeviceBrightness(device: Device, brightness: number): Promise<void> {
+        try {
+            const payload: DeviceColorState = {
+                state: brightness > 0 ? 'ON' : 'OFF'
+            };
+
+            if (brightness > 0) {
+                payload.brightness = brightness;
+            }
+
+            await this.publishEntityState(device, payload, 'e131_control');
+        } catch (error: any) {
+            logger.error(`E1.31: Error updating device brightness ${device.name}: ${error.message}`);
+        }
+    }
+
+    private async updateDeviceColor(device: Device, red: number, green: number, blue: number, white?: number): Promise<void> {
+        try {
+            // Convert RGB to xy color space for Zigbee
+            const xy = this.rgbToXy(red, green, blue);
+            const brightness = Math.max(red, green, blue);
+
+            const payload: DeviceColorState = {
+                state: brightness > 0 ? 'ON' : 'OFF'
+            };
+
+            if (brightness > 0) {
+                payload.brightness = brightness;
+                payload.color = { x: xy.x, y: xy.y };
+                
+                // Add white channel if supported and provided
+                if (white !== undefined && this.deviceSupportsWhite(device)) {
+                    (payload as any).color_temp = this.whiteToColorTemp(white);
+                }
+            }
+
+            await this.publishEntityState(device, payload, 'e131_control');
+            
+        } catch (error: any) {
+            logger.error(`E1.31: Error updating device color ${device.name}: ${error.message}`);
+        }
+    }
+
+    private rgbToXy(red: number, green: number, blue: number): {x: number, y: number} {
+        // Normalize RGB values
+        const r = red / 255;
+        const g = green / 255; 
+        const b = blue / 255;
+
+        // Apply gamma correction
+        const rGamma = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+        const gGamma = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+        const bGamma = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+
+        // Convert to XYZ using sRGB matrix
+        const X = rGamma * 0.4124564 + gGamma * 0.3575761 + bGamma * 0.1804375;
+        const Y = rGamma * 0.2126729 + gGamma * 0.7151522 + bGamma * 0.0721750;
+        const Z = rGamma * 0.0193339 + gGamma * 0.1191920 + bGamma * 0.9503041;
+
+        // Convert to xy chromaticity coordinates
+        const sum = X + Y + Z;
+        const x = sum === 0 ? 0.3127 : X / sum; // Default to D65 white point if black
+        const y = sum === 0 ? 0.3290 : Y / sum;
+
+        // Clamp to valid range
+        return { 
+            x: Math.max(0, Math.min(1, x)), 
+            y: Math.max(0, Math.min(1, y)) 
+        };
+    }
+
+    private whiteToColorTemp(white: number): number {
+        // Convert white channel (0-255) to color temperature (mireds)
+        // This is a simplified conversion - you may want to make this configurable
+        const minTemp = 153; // ~6500K (cool white)
+        const maxTemp = 500; // ~2000K (warm white)
+        
+        return Math.round(minTemp + (white / 255) * (maxTemp - minTemp));
+    }
+
+    private deviceSupportsWhite(device: Device): boolean {
+        // Check if device supports color temperature
+        // This would need to be implemented based on device capabilities
+        try {
+            const definition = device.definition;
+            if (!definition) return false;
+            
+            // Check exposes for color_temp support
+            return definition.exposes?.some((expose: any) => 
+                expose.features?.some((feature: any) => feature.name === 'color_temp')
+            ) || false;
+        } catch {
+            return false;
+        }
+    }
+
+    private getMulticastAddress(universeId: number): string {
+        const high = (universeId >> 8) & 0xFF;
+        const low = universeId & 0xFF;
+        return `239.255.${high}.${low}`;
+    }
+
+    private isDevice(entity: Device | Group): entity is Device {
+        return 'ieeeAddr' in entity;
+    }
+}
+
+// Export for Zigbee2MQTT extension system
+module.exports = E131Extension;

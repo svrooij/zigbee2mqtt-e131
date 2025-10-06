@@ -1,0 +1,184 @@
+import * as dgram from 'node:dgram';
+import Extension from './extension';
+import logger from '../util/logger';
+import * as settings from '../util/settings';
+
+export default class E131Extension extends Extension {
+    private server?: dgram.Socket;
+    private universeMap: Map<number, string[]> = new Map(); // universe -> device IDs
+    private readonly SACN_PORT = 5568;
+
+    override async start(): Promise<void> {
+        await super.start();
+        
+        // Load E1.31 configuration from settings
+        const e131Config = settings.get().e131 || {};
+        const universes = e131Config.universes || [];
+        
+        // Setup universe to device mapping
+        this.setupUniverseMapping(universes);
+        
+        // Start E1.31 server
+        await this.startE131Server();
+        
+        logger.info('E1.31 extension started');
+    }
+
+    override async stop(): Promise<void> {
+        if (this.server) {
+            this.server.close();
+            this.server = undefined;
+        }
+        
+        await super.stop();
+        logger.info('E1.31 extension stopped');
+    }
+
+    private setupUniverseMapping(universes: any[]): void {
+        for (const universe of universes) {
+            this.universeMap.set(universe.id, universe.devices || []);
+        }
+    }
+
+    private async startE131Server(): Promise<void> {
+        this.server = dgram.createSocket('udp4');
+        
+        this.server.on('message', (msg, rinfo) => {
+            try {
+                const packet = this.parseE131Packet(msg);
+                if (packet) {
+                    this.handleLightingData(packet);
+                }
+            } catch (error) {
+                logger.error(`E1.31 packet parsing error: ${error}`);
+            }
+        });
+
+        this.server.on('listening', () => {
+            const address = this.server!.address();
+            logger.info(`E1.31 server listening on ${address.address}:${address.port}`);
+            
+            // Join multicast groups for configured universes
+            for (const universeId of this.universeMap.keys()) {
+                const multicastAddress = this.getMulticastAddress(universeId);
+                this.server!.addMembership(multicastAddress);
+                logger.info(`Joined multicast group for universe ${universeId}: ${multicastAddress}`);
+            }
+        });
+
+        this.server.bind(this.SACN_PORT);
+    }
+
+    private parseE131Packet(buffer: Buffer): E131Packet | null {
+        // Implement E1.31 packet parsing
+        // Based on the C# examples found, the packet structure includes:
+        // - Root Layer (38 bytes)
+        // - Framing Layer (77 bytes) 
+        // - DMP Layer + DMX data (513 bytes)
+        
+        if (buffer.length < 126) return null; // Minimum packet size
+        
+        try {
+            // Parse packet identifier
+            const packetId = buffer.subarray(16, 28);
+            const expectedId = Buffer.from([0x41, 0x53, 0x43, 0x2d, 0x45, 0x31, 0x2e, 0x31, 0x37, 0x00, 0x00, 0x00]);
+            
+            if (!packetId.equals(expectedId)) return null;
+            
+            // Extract universe ID (2 bytes at offset 113)
+            const universeId = buffer.readUInt16BE(113);
+            
+            // Extract sequence number (1 byte at offset 111)
+            const sequence = buffer.readUInt8(111);
+            
+            // Extract DMX data (starts at offset 126, up to 512 channels)
+            const dmxData = buffer.subarray(126, 126 + 512);
+            
+            return {
+                universeId,
+                sequence,
+                data: Array.from(dmxData)
+            };
+        } catch (error) {
+            logger.error(`Error parsing E1.31 packet: ${error}`);
+            return null;
+        }
+    }
+
+    private async handleLightingData(packet: E131Packet): Promise<void> {
+        const deviceIds = this.universeMap.get(packet.universeId);
+        if (!deviceIds || deviceIds.length === 0) return;
+
+        // Map DMX channels to zigbee devices
+        for (let i = 0; i < deviceIds.length; i++) {
+            const deviceId = deviceIds[i];
+            const device = this.zigbee.resolveEntity(deviceId);
+            
+            if (!device || !device.isDevice()) continue;
+
+            // Calculate DMX channel offset for this device (assuming RGB devices use 3 channels each)
+            const channelOffset = i * 3;
+            
+            if (channelOffset + 2 >= packet.data.length) continue;
+
+            const red = packet.data[channelOffset];
+            const green = packet.data[channelOffset + 1]; 
+            const blue = packet.data[channelOffset + 2];
+
+            // Convert RGB to zigbee format and publish
+            await this.updateDeviceColor(device, red, green, blue);
+        }
+    }
+
+    private async updateDeviceColor(device: Device, red: number, green: number, blue: number): Promise<void> {
+        try {
+            // Convert RGB (0-255) to xy color space for zigbee
+            const xy = this.rgbToXy(red, green, blue);
+            const brightness = Math.max(red, green, blue);
+
+            const payload: any = {
+                state: brightness > 0 ? 'ON' : 'OFF'
+            };
+
+            if (brightness > 0) {
+                payload.brightness = brightness;
+                payload.color = { x: xy.x, y: xy.y };
+            }
+
+            // Publish state change
+            await this.publishEntityState(device, payload, 'e131_control');
+            
+        } catch (error) {
+            logger.error(`Error updating device ${device.name}: ${error}`);
+        }
+    }
+
+    private rgbToXy(red: number, green: number, blue: number): {x: number, y: number} {
+        // Convert RGB to XY color space (simplified conversion)
+        // For production use, implement proper RGB->XY conversion
+        const r = red / 255;
+        const g = green / 255; 
+        const b = blue / 255;
+
+        const X = r * 0.4124 + g * 0.3576 + b * 0.1805;
+        const Y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+        const Z = r * 0.0193 + g * 0.1192 + b * 0.9505;
+
+        const x = X / (X + Y + Z);
+        const y = Y / (X + Y + Z);
+
+        return { x: isNaN(x) ? 0 : x, y: isNaN(y) ? 0 : y };
+    }
+
+    private getMulticastAddress(universeId: number): string {
+        const high = (universeId >> 8) & 0xFF;
+        const low = universeId & 0xFF;
+        return `239.255.${high}.${low}`;
+    }
+}
+
+interface E131Packet {
+    universeId: number;
+    sequence: number;
+    data: number[];
+}
